@@ -314,9 +314,9 @@ if __name__ == "__main__":
     print(1)
 
 
-    def connect_to_database(database_name):
-        neo4j_uri = "bolt://localhost:7687"
-        neo4j_user = "neo4j"
-        neo4j_password = "journalbeat"
-        driver = GraphDatabase.driver(neo4j_uri, auth=basic_auth(neo4j_user, neo4j_password), database=database_name)
-        return driver
+    # def connect_to_database(database_name):
+    #     neo4j_uri = "bolt://localhost:7687"
+    #     neo4j_user = "neo4j"
+    #     neo4j_password = "journalbeat"
+    #     driver = GraphDatabase.driver(neo4j_uri, auth=basic_auth(neo4j_user, neo4j_password), database=database_name)
+    #     return driver

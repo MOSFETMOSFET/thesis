@@ -207,7 +207,7 @@ def main():
 
     l.debug(f"Execution time : {elapsed_time} seconds")
 
-    nx.write_gpickle(G, "graph.gpickle")
+    # nx.write_gpickle(G, "graph.gpickle")
 
     # displayer: Displayer = Displayer(G)
     # displayer.display()
@@ -228,16 +228,41 @@ def get_player(player: str, players: List[Player]) -> Player:
     return players[0]
 
 
-def test_display(G: nx.MultiDiGraph, layout_file: str = "layout.json"):
+# def test_display(G: nx.MultiDiGraph, layout_file: str = "layout.json"):
+#
+#     pos = nx.spring_layout(G, k=5, iterations=50)
+#
+#
+#     pos_list = {key: list(value) for key, value in pos.items()}
+#
+#
+#     with open(layout_file, "w") as f:
+#         json.dump(pos_list, f)
+#
+#     nx.draw(G, pos, with_labels=True, node_size=200, node_color="skyblue", font_size=10, font_color="black")
+#     nx.draw_networkx_edge_labels(G, pos, edge_labels={(u, v): d["count"] for u, v, d in G.edges(data=True)}, font_size=8)
+#
+#     plt.show()
 
+def test_display(G: nx.MultiDiGraph, layout_file: str = "graph_data.json"):
     pos = nx.spring_layout(G, k=5, iterations=50)
-
-
     pos_list = {key: list(value) for key, value in pos.items()}
 
+    nodes = []
+    for n, data in G.nodes(data=True):
+        node = {"id": n, "pos": pos_list[n]}
+        node.update(data)
+        nodes.append(node)
+
+    edges = []
+    for u, v, data in G.edges(data=True):
+        edge = {"source": u, "target": v, "data": data}
+        edges.append(edge)
+
+    graph_data = {"nodes": nodes, "edges": edges}
 
     with open(layout_file, "w") as f:
-        json.dump(pos_list, f)
+        json.dump(graph_data, f)
 
     nx.draw(G, pos, with_labels=True, node_size=200, node_color="skyblue", font_size=10, font_color="black")
     nx.draw_networkx_edge_labels(G, pos, edge_labels={(u, v): d["count"] for u, v, d in G.edges(data=True)}, font_size=8)
