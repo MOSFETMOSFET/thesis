@@ -47,7 +47,7 @@ def main():
         data = json.load(fichier)
         all_players = []
 
-        print('start making complete player data file')
+        print('start making player_data.json')
 
         for player in data:
             all_players.append(Player(player["name"], player["id"]))
@@ -87,7 +87,7 @@ def main():
             p.vpn_ip = player["vpn_ip"]
             players.append(p)
 
-    print('make complete player data file complete')
+    print('player_data.json complete')
 
     t: Timeframe = Timeframe(
         maya_parse("2022-10-04T00:00:01"), maya_parse("2022-10-04T23:59:59")

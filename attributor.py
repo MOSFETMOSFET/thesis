@@ -247,11 +247,11 @@ def flows_over_path(
     source = prev_instance
     destination = target_instance
 
-    print('querying path')
+    print('start flows_over_path_query_result')
 
     hits = flows_over_path_query_result(source, destination, session)
 
-    print('querying path complete')
+    print('flows_over_path_query_result complete')
 
     flows = [
         FlowPart(
@@ -453,9 +453,9 @@ def get_network_map_session(session: PlayerSession) -> nx.DiGraph:
         data = con.execute(req)
 
         if data.fetchone() is None:
-            print("The cursor is empty")
+            print("The data is empty")
         else:
-            print("data can work")
+            print("data is not empty")
 
         for row in data:
             if row[0] not in G.nodes:
