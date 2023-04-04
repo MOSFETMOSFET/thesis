@@ -2,6 +2,24 @@ from elasticsearch.client import Elasticsearch
 from elasticsearch_dsl import A, Q, Search
 from neo4j import GraphDatabase
 import json
+from uuid import uuid4
+
+def convert_ip_to_w1_sx(ip_address: str) -> str:
+    if ip_address.startswith("192.168.0."):
+        last_octet = int(ip_address.split(".")[-1])
+        return f"w1-s{last_octet}"
+    return ip_address
+
+
+def get_hostname_for_ip(ip_address: str, packet_data: dict) -> str:
+    if "observer" in packet_data and "ip" in packet_data["observer"] and "hostname" in packet_data["observer"]:
+        ip_list = packet_data["observer"]["ip"]
+        hostname = packet_data["observer"]["hostname"]
+
+        if ip_address in ip_list:
+            return hostname
+
+    return ip_address
 
 
 def get_packetbeat_filtered_packets() -> None:
@@ -35,10 +53,10 @@ def get_packetbeat_filtered_packets() -> None:
     world_name = "en2720-w1"
 
     filter = Q(
-        "range", event__start={"lte": 20221001, "gte": 20221001, "format": "basic_date"}
+        "range", event__start={"lte": 20221003, "gte": 20221003, "format": "basic_date"}
     )
     filter &= Q(
-        "range", event__end={"lte": 20221001, "gte": 20221001, "format": "basic_date"}
+        "range", event__end={"lte": 20221003, "gte": 20221003, "format": "basic_date"}
     )
     agent = Q("term", agent__type=agent_type)
 
@@ -83,31 +101,62 @@ def get_packetbeat_filtered_packets() -> None:
 
     print('Neo4j connection established')
 
-    # Create nodes and relationships
-    cypher = """
-        MERGE (source:IP {name: $source_ip})
-        MERGE (destination:IP {name: $destination_ip})
-        MERGE (source)-[t:TRANSPORT {name: $transport}]->(destination)
-        ON CREATE SET t.count = 1
-        ON MATCH SET t.count = t.count + 1
-        RETURN t
-    """
-
     with driver.session() as session:
+        previous_packet = None
         for h in s.scan():
+
+            source_ip = convert_ip_to_w1_sx(h.source.ip)
+            destination_ip = convert_ip_to_w1_sx(h.destination.ip)
+            source_hostname = get_hostname_for_ip(source_ip, h.to_dict())
+            destination_hostname = get_hostname_for_ip(destination_ip, h.to_dict())
+
             params = {
                 "event_start": h.event.start,
                 "event_end": h.event.end,
-                "source_ip": h.source.ip,
+                "source_ip": source_ip,
                 "source_port": getattr(h.source, "port", None),
-                "destination_ip": h.destination.ip,
+                "destination_ip": destination_ip,
                 "destination_port": getattr(h.destination, "port", None),
                 "transport": getattr(h.network, "transport", None),
+                "source_hostname": source_hostname or "unknown",
+                "destination_hostname": destination_hostname or "unknown",
+                "attribution_label": None,
             }
+
+            if (
+                    previous_packet
+                    and previous_packet["source_port"] == params["source_port"]
+                    and previous_packet["destination_port"] == params["destination_port"]
+            ):
+                params["attribution_label"] = previous_packet["attribution_label"]
+            elif not previous_packet:
+                params["attribution_label"] = str(uuid4())
+
+            if params["transport"] is None:
+                params["transport"] = "unknown"
+
+            cypher = """
+                    MERGE (source:IP {name: $source_ip, hostname: $source_hostname})
+                    MERGE (destination:IP {name: $destination_ip, hostname: $destination_hostname})
+                    MERGE (source)-[t:TRANSPORT {name: $transport}]->(destination)
+                    ON CREATE SET t.count = 1, t.source_port = $source_port, t.destination_port = $destination_port
+                    ON MATCH SET t.count = t.count + 1
+                """
+
+            if params["attribution_label"]:
+                cypher += """
+                        SET t.attribution_label = $attribution_label
+                    """
+
+            cypher += """
+                    RETURN t
+                """
+
             session.run(cypher, params)
+            previous_packet = params
 
     driver.close()
-
     print('Nodes and relationships created in Neo4j')
+
 
 get_packetbeat_filtered_packets()
