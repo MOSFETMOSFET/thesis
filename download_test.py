@@ -2,13 +2,43 @@ from elasticsearch.client import Elasticsearch
 from elasticsearch_dsl import A, Q, Search
 from neo4j import GraphDatabase
 import json
-from uuid import uuid4
+import time
 
 def convert_ip_to_w1_sx(ip_address: str) -> str:
     if ip_address.startswith("192.168.0."):
         last_octet = int(ip_address.split(".")[-1])
         return f"w1-s{last_octet}"
     return ip_address
+
+def set_attribution_label_recursive(session, starting_nodes, visited_edges=None, iteration=0):
+    if visited_edges is None:
+        visited_edges = set()
+
+    print(f"Current iteration: {iteration}")
+
+    for start_node_name in starting_nodes:
+        cypher = f"""
+            MATCH (start_node:IP {{name: '{start_node_name}'}})
+            MATCH (start_node)-[direct_conn:TRANSPORT]->(direct_neighbor:IP)
+            WHERE NOT id(direct_conn) IN {list(visited_edges)}
+            SET direct_conn.attribution_label = start_node.name
+            WITH start_node, direct_neighbor, direct_conn
+            MATCH (direct_neighbor)-[outgoing:TRANSPORT]->(other:IP)
+            WHERE (direct_neighbor)-[:TRANSPORT {{source_port: outgoing.source_port, destination_port: outgoing.destination_port, name: outgoing.name}}]->(start_node)
+                  AND NOT id(outgoing) IN {list(visited_edges)}
+            SET outgoing.attribution_label = start_node.name
+            RETURN id(direct_conn) as direct_conn_id, id(outgoing) as outgoing_id, other.name as other_name
+        """
+        records = session.run(cypher)
+
+        next_starting_nodes = []
+        for record in records:
+            next_starting_nodes.append(record["other_name"])
+            visited_edges.add(record["direct_conn_id"])
+            visited_edges.add(record["outgoing_id"])
+
+        if next_starting_nodes:
+            set_attribution_label_recursive(session, next_starting_nodes, visited_edges, iteration=iteration + 1)
 
 
 def get_hostname_for_ip(ip_address: str, packet_data: dict) -> str:
@@ -21,6 +51,44 @@ def get_hostname_for_ip(ip_address: str, packet_data: dict) -> str:
 
     return ip_address
 
+def update_attribution_label(session, source_ip, source_port, destination_port, transport):
+    cypher = """
+        MATCH (source:IP {name: $source_ip})
+        MATCH (destination:IP)-[t:TRANSPORT {name: $transport}]->(source)
+        WHERE t.source_port = $source_port AND t.destination_port = $destination_port
+        MATCH (destination)-[r:TRANSPORT]->(connected)
+        WHERE r.source_port = t.source_port AND r.destination_port = t.destination_port AND r.name = t.name
+        SET r.attribution_label = source.name
+    """
+    params = {
+        "source_ip": source_ip,
+        "source_port": source_port,
+        "destination_port": destination_port,
+        "transport": transport,
+    }
+    session.run(cypher, params)
+
+
+def get_edges_with_non_none_attribution_label(session):
+    cypher = """
+        MATCH (a:IP)-[r:TRANSPORT]->(b:IP)
+        WHERE r.attribution_label <> 'none'
+        RETURN a.name AS source_ip, b.name AS destination_ip, r.transport AS transport, r.source_port AS source_port, r.destination_port AS destination_port, r.attribution_label AS attribution_label
+    """
+    result = session.run(cypher)
+    return result.data()
+
+
+def merge_edges(session):
+    cypher = """
+        MATCH (a:IP)-[r1:TRANSPORT]->(b:IP)
+        MATCH (a)-[r2:TRANSPORT]->(b)
+        WHERE r1.attribution_label = 'none' AND r2.attribution_label = 'none' AND r1.transport = r2.transport AND id(r1) <> id(r2)
+        WITH a, b, r1, r2
+        SET r2.count = coalesce(r2.count, 1) + coalesce(r1.count, 1)
+        DELETE r1
+    """
+    session.run(cypher)
 
 def get_packetbeat_filtered_packets() -> None:
     """Retrieves packetbeat packets from the Elasticsearch database and saves
@@ -102,7 +170,9 @@ def get_packetbeat_filtered_packets() -> None:
     print('Neo4j connection established')
 
     with driver.session() as session:
+
         previous_packet = None
+
         for h in s.scan():
 
             source_ip = convert_ip_to_w1_sx(h.source.ip)
@@ -114,10 +184,10 @@ def get_packetbeat_filtered_packets() -> None:
                 "event_start": h.event.start,
                 "event_end": h.event.end,
                 "source_ip": source_ip,
-                "source_port": getattr(h.source, "port", None),
+                "source_port": getattr(h.source, "port", "unknown" ),
                 "destination_ip": destination_ip,
-                "destination_port": getattr(h.destination, "port", None),
-                "transport": getattr(h.network, "transport", None),
+                "destination_port": getattr(h.destination, "port", "unknown"),
+                "transport": getattr(h.network, "transport", "unknown"),
                 "source_hostname": source_hostname or "unknown",
                 "destination_hostname": destination_hostname or "unknown",
                 "attribution_label": None,
@@ -127,36 +197,61 @@ def get_packetbeat_filtered_packets() -> None:
                     previous_packet
                     and previous_packet["source_port"] == params["source_port"]
                     and previous_packet["destination_port"] == params["destination_port"]
+                    and previous_packet["transport"] == params["transport"]
+                    and (
+                    previous_packet["attribution_label"] == "none"
+                    or source_ip.startswith("w1-s")
+                    or previous_packet["source_ip"].startswith("w1-s")
+            )
             ):
                 params["attribution_label"] = previous_packet["attribution_label"]
-            elif not previous_packet:
-                params["attribution_label"] = str(uuid4())
+            else:
+                params["attribution_label"] = "none"
 
-            if params["transport"] is None:
-                params["transport"] = "unknown"
 
-            cypher = """
-                    MERGE (source:IP {name: $source_ip, hostname: $source_hostname})
-                    MERGE (destination:IP {name: $destination_ip, hostname: $destination_hostname})
-                    MERGE (source)-[t:TRANSPORT {name: $transport}]->(destination)
-                    ON CREATE SET t.count = 1, t.source_port = $source_port, t.destination_port = $destination_port
-                    ON MATCH SET t.count = t.count + 1
-                """
+            create_or_update_node_cypher = """
+                MERGE (source:IP {name: $source_ip})
+                ON CREATE SET source.hostname = $source_hostname
+                MERGE (destination:IP {name: $destination_ip})
+                ON CREATE SET destination.hostname = $destination_hostname
+            """
 
-            if params["attribution_label"]:
-                cypher += """
-                        SET t.attribution_label = $attribution_label
-                    """
+            session.run(create_or_update_node_cypher, params)
 
-            cypher += """
-                    RETURN t
-                """
 
-            session.run(cypher, params)
-            previous_packet = params
+            create_or_update_edge_cypher = """
+                MERGE (source:IP {name: $source_ip})
+                MERGE (destination:IP {name: $destination_ip})
+                CREATE (source)-[r:TRANSPORT {
+                    name: $transport,
+                    source_port: $source_port,
+                    destination_port: $destination_port,
+                    attribution_label: $attribution_label
+                }]->(destination)
+            """
+            session.run(create_or_update_edge_cypher, params)
+
+        starting_nodes = [f"w1-s{i}" for i in range(1, 255)]
+        set_attribution_label_recursive(session, starting_nodes)
+
+        merge_edges(session)
 
     driver.close()
     print('Nodes and relationships created in Neo4j')
 
 
-get_packetbeat_filtered_packets()
+if __name__ == "__main__":
+    start_time = time.time()
+    get_packetbeat_filtered_packets()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f'Execution time is: {execution_time} seconds')
+
+
+
+
+
+
+
+
+
