@@ -12,7 +12,34 @@ def set_initial_attribution_labels(session, source_prefix):
     session.run(cypher)
 
 
+def get_connected_nodes(session, node_name):
+    connected_nodes = session.run("""
+        MATCH (n {name: $node_name})-[r]->(connected:Node)
+        RETURN connected.name AS name
+    """, node_name=node_name).data()
+
+    return [connected_node['name'] for connected_node in connected_nodes]
+
+
+def propagate_labels(session, node_name):
+
+    connected_nodes = get_connected_nodes(session, node_name)
+
+    if not connected_nodes:
+        return
+
+    for connected_node in connected_nodes:
+
+        matched = set_attribution_label(session, connected_node)
+
+        if matched:
+            propagate_labels(session, connected_node)
+
+
 def set_attribution_label(session, node_name):
+
+    matched = False
+
     # 查询指向该节点的边
     incoming_rels = session.run("""
         MATCH (n {name: $node_name})<-[r]-()
@@ -33,11 +60,16 @@ def set_attribution_label(session, node_name):
                 and incoming_rel['destination_port'] == outgoing_rel['destination_port']
                 and incoming_rel['transport'] == outgoing_rel['transport']
             ):
+
+                matched = True
                 # 如果属性相同，更新出边的 attribution_label
                 session.run("""
                     MATCH ()-[r]->() WHERE ID(r) = $id
                     SET r.attribution_label = $attribution_label
                 """, id=outgoing_rel['id'], attribution_label=incoming_rel['attribution_label'])
+
+
+    return matched
 
 uri = "bolt://localhost:7687"
 user = "neo4j"
@@ -84,9 +116,11 @@ with driver.session() as session:
             )
         )
 
+    vpn_instance = '192.168.0.3'
+
     set_initial_attribution_labels(session, 'w1-s')
-    set_attribution_label(session, '192.168.0.3')
-    # propagate_attribution_labels(session, ['192.168.0.3'])
+    set_attribution_label(session, vpn_instance)
+    propagate_labels(session, vpn_instance)
 
 driver.close()
 
