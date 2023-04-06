@@ -2,6 +2,7 @@
 
 """This module allows to create an adapted visualization of the network traffic
 from a graph that represents the connections between the hosts."""
+#initial
 
 import copy
 import re

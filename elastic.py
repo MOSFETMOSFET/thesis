@@ -2,6 +2,7 @@ import json
 
 from elasticsearch.client import Elasticsearch
 from elasticsearch_dsl import Search
+#initial
 
 # NOTE: Using the API port requires a connection through the KTH VPN
 es_connection = {

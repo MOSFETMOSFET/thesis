@@ -3,6 +3,8 @@
 """The purpose of this module is to act as an interface between the executor
 module, the Elasticsearch database and the local database."""
 
+#initial
+
 import json
 import sqlite3 as sl
 from typing import Any, Dict, List

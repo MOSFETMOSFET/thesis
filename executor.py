@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+#initial
 
 import json
 import os
@@ -20,6 +21,8 @@ from twmn_helpers.logging import Logging
 from twmn_helpers.time import Timeframe
 import warnings
 import matplotlib.pyplot as plt
+
+
 
 warnings.filterwarnings('ignore')
 
