@@ -1,36 +1,6 @@
 from neo4j import GraphDatabase
 import random
-
-
-def set_attribution_label_recursive(session, starting_nodes, visited_edges=None, iteration=0):
-    if visited_edges is None:
-        visited_edges = set()
-
-    print(f"Current iteration: {iteration}")
-
-    for start_node_name in starting_nodes:
-        cypher = f"""
-            MATCH (start_node:IP {{name: '{start_node_name}'}})
-            MATCH (start_node)-[direct_conn:TRANSPORT]->(direct_neighbor:IP)
-            WHERE NOT id(direct_conn) IN {list(visited_edges)}
-            SET direct_conn.attribution_label = start_node.name
-            WITH start_node, direct_neighbor, direct_conn
-            MATCH (direct_neighbor)-[outgoing:TRANSPORT]->(other:IP)
-            WHERE (direct_neighbor)-[:TRANSPORT {{source_port: outgoing.source_port, destination_port: outgoing.destination_port, name: outgoing.name}}]->(start_node)
-                  AND NOT id(outgoing) IN {list(visited_edges)}
-            SET outgoing.attribution_label = start_node.name
-            RETURN id(direct_conn) as direct_conn_id, id(outgoing) as outgoing_id, other.name as other_name
-        """
-        records = session.run(cypher)
-
-        next_starting_nodes = []
-        for record in records:
-            next_starting_nodes.append(record["other_name"])
-            visited_edges.add(record["direct_conn_id"])
-            visited_edges.add(record["outgoing_id"])
-
-        if next_starting_nodes:
-            set_attribution_label_recursive(session, next_starting_nodes, visited_edges, iteration=iteration + 1)
+from collections import deque
 
 
 def set_initial_attribution_labels(session, source_prefix):
@@ -41,6 +11,33 @@ def set_initial_attribution_labels(session, source_prefix):
     """
     session.run(cypher)
 
+
+def set_attribution_label(session, node_name):
+    # 查询指向该节点的边
+    incoming_rels = session.run("""
+        MATCH (n {name: $node_name})<-[r]-()
+        RETURN r.source_port AS source_port, r.destination_port AS destination_port, r.transport AS transport, r.attribution_label AS attribution_label
+    """, node_name=node_name).data()
+
+    # 查询从该节点发出的边
+    outgoing_rels = session.run("""
+        MATCH (n {name: $node_name})-[r]->()
+        RETURN ID(r) AS id, r.source_port AS source_port, r.destination_port AS destination_port, r.transport AS transport
+    """, node_name=node_name).data()
+
+    # 比较入边和出边的属性
+    for incoming_rel in incoming_rels:
+        for outgoing_rel in outgoing_rels:
+            if (
+                incoming_rel['source_port'] == outgoing_rel['source_port']
+                and incoming_rel['destination_port'] == outgoing_rel['destination_port']
+                and incoming_rel['transport'] == outgoing_rel['transport']
+            ):
+                # 如果属性相同，更新出边的 attribution_label
+                session.run("""
+                    MATCH ()-[r]->() WHERE ID(r) = $id
+                    SET r.attribution_label = $attribution_label
+                """, id=outgoing_rel['id'], attribution_label=incoming_rel['attribution_label'])
 
 uri = "bolt://localhost:7687"
 user = "neo4j"
@@ -88,6 +85,8 @@ with driver.session() as session:
         )
 
     set_initial_attribution_labels(session, 'w1-s')
+    set_attribution_label(session, '192.168.0.3')
+    # propagate_attribution_labels(session, ['192.168.0.3'])
 
 driver.close()
 
