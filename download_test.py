@@ -3,43 +3,13 @@ from elasticsearch_dsl import A, Q, Search
 from neo4j import GraphDatabase
 import json
 import time
+from uuid import uuid4
 
 def convert_ip_to_w1_sx(ip_address: str) -> str:
     if ip_address.startswith("192.168.0."):
         last_octet = int(ip_address.split(".")[-1])
         return f"w1-s{last_octet}"
     return ip_address
-
-def set_attribution_label_recursive(session, starting_nodes, visited_edges=None, iteration=0):
-    if visited_edges is None:
-        visited_edges = set()
-
-    print(f"Current iteration: {iteration}")
-
-    for start_node_name in starting_nodes:
-        cypher = f"""
-            MATCH (start_node:IP {{name: '{start_node_name}'}})
-            MATCH (start_node)-[direct_conn:TRANSPORT]->(direct_neighbor:IP)
-            WHERE NOT id(direct_conn) IN {list(visited_edges)}
-            SET direct_conn.attribution_label = start_node.name
-            WITH start_node, direct_neighbor, direct_conn
-            MATCH (direct_neighbor)-[outgoing:TRANSPORT]->(other:IP)
-            WHERE (direct_neighbor)-[:TRANSPORT {{source_port: outgoing.source_port, destination_port: outgoing.destination_port, name: outgoing.name}}]->(start_node)
-                  AND NOT id(outgoing) IN {list(visited_edges)}
-            SET outgoing.attribution_label = start_node.name
-            RETURN id(direct_conn) as direct_conn_id, id(outgoing) as outgoing_id, other.name as other_name
-        """
-        records = session.run(cypher)
-
-        next_starting_nodes = []
-        for record in records:
-            next_starting_nodes.append(record["other_name"])
-            visited_edges.add(record["direct_conn_id"])
-            visited_edges.add(record["outgoing_id"])
-
-        if next_starting_nodes:
-            set_attribution_label_recursive(session, next_starting_nodes, visited_edges, iteration=iteration + 1)
-
 
 def get_hostname_for_ip(ip_address: str, packet_data: dict) -> str:
     if "observer" in packet_data and "ip" in packet_data["observer"] and "hostname" in packet_data["observer"]:
@@ -51,44 +21,36 @@ def get_hostname_for_ip(ip_address: str, packet_data: dict) -> str:
 
     return ip_address
 
-def update_attribution_label(session, source_ip, source_port, destination_port, transport):
-    cypher = """
-        MATCH (source:IP {name: $source_ip})
-        MATCH (destination:IP)-[t:TRANSPORT {name: $transport}]->(source)
-        WHERE t.source_port = $source_port AND t.destination_port = $destination_port
-        MATCH (destination)-[r:TRANSPORT]->(connected)
-        WHERE r.source_port = t.source_port AND r.destination_port = t.destination_port AND r.name = t.name
-        SET r.attribution_label = source.name
+def delete_irrelevant_nodes(session):
+    # Find the largest connected component
+    cypher_find_largest_connected_component = '''
+    MATCH (n)
+    CALL apoc.path.subgraphAll(n, {
+      minLevel: 1
+    })
+    YIELD nodes, relationships
+    WITH apoc.coll.toSet(nodes) AS largest_connected_component
+    RETURN largest_connected_component
+    '''
+
+    largest_connected_component = session.run(cypher_find_largest_connected_component).single()[0]
+
+    # Delete nodes that are not part of the largest connected component
+    cypher_delete_nodes_not_in_largest_component = """
+    MATCH (n)
+    WHERE NOT id(n) IN $largest_connected_component_ids
+    DETACH DELETE n
+    RETURN count(*) as deleted_nodes_count
     """
-    params = {
-        "source_ip": source_ip,
-        "source_port": source_port,
-        "destination_port": destination_port,
-        "transport": transport,
-    }
-    session.run(cypher, params)
 
+    largest_connected_component_ids = [node.id for node in largest_connected_component]
+    result = session.run(cypher_delete_nodes_not_in_largest_component,
+                         {"largest_connected_component_ids": largest_connected_component_ids})
 
-def get_edges_with_non_none_attribution_label(session):
-    cypher = """
-        MATCH (a:IP)-[r:TRANSPORT]->(b:IP)
-        WHERE r.attribution_label <> 'none'
-        RETURN a.name AS source_ip, b.name AS destination_ip, r.transport AS transport, r.source_port AS source_port, r.destination_port AS destination_port, r.attribution_label AS attribution_label
-    """
-    result = session.run(cypher)
-    return result.data()
+    total_deleted_nodes = result.single()[0]
 
+    return total_deleted_nodes
 
-def merge_edges(session):
-    cypher = """
-        MATCH (a:IP)-[r1:TRANSPORT]->(b:IP)
-        MATCH (a)-[r2:TRANSPORT]->(b)
-        WHERE r1.attribution_label = 'none' AND r2.attribution_label = 'none' AND r1.transport = r2.transport AND id(r1) <> id(r2)
-        WITH a, b, r1, r2
-        SET r2.count = coalesce(r2.count, 1) + coalesce(r1.count, 1)
-        DELETE r1
-    """
-    session.run(cypher)
 
 def get_packetbeat_filtered_packets() -> None:
     """Retrieves packetbeat packets from the Elasticsearch database and saves
@@ -121,10 +83,10 @@ def get_packetbeat_filtered_packets() -> None:
     world_name = "en2720-w1"
 
     filter = Q(
-        "range", event__start={"lte": 20221003, "gte": 20221003, "format": "basic_date"}
+        "range", event__start={"lte": 20221001, "gte": 20221001, "format": "basic_date"}
     )
     filter &= Q(
-        "range", event__end={"lte": 20221003, "gte": 20221003, "format": "basic_date"}
+        "range", event__end={"lte": 20221001, "gte": 20221001, "format": "basic_date"}
     )
     agent = Q("term", agent__type=agent_type)
 
@@ -184,12 +146,12 @@ def get_packetbeat_filtered_packets() -> None:
                 "event_start": h.event.start,
                 "event_end": h.event.end,
                 "source_ip": source_ip,
-                "source_port": getattr(h.source, "port", "unknown" ),
+                "source_port": getattr(h.source, "port", None),
                 "destination_ip": destination_ip,
-                "destination_port": getattr(h.destination, "port", "unknown"),
+                "destination_port": getattr(h.destination, "port", None),
                 "transport": getattr(h.network, "transport", "unknown"),
-                "source_hostname": source_hostname or "unknown",
-                "destination_hostname": destination_hostname or "unknown",
+                "source_hostname": source_hostname or source_ip,
+                "destination_hostname": destination_hostname or destination_ip,
                 "attribution_label": None,
             }
 
@@ -208,6 +170,7 @@ def get_packetbeat_filtered_packets() -> None:
             else:
                 params["attribution_label"] = "none"
 
+            # create nodes
 
             create_or_update_node_cypher = """
                 MERGE (source:IP {name: $source_ip})
@@ -218,26 +181,24 @@ def get_packetbeat_filtered_packets() -> None:
 
             session.run(create_or_update_node_cypher, params)
 
-
-            create_or_update_edge_cypher = """
-                MERGE (source:IP {name: $source_ip})
-                MERGE (destination:IP {name: $destination_ip})
-                CREATE (source)-[r:TRANSPORT {
-                    name: $transport,
-                    source_port: $source_port,
-                    destination_port: $destination_port,
-                    attribution_label: $attribution_label
-                }]->(destination)
+            # create relationship
+            create_or_update_relationship_cypher = """
+                MATCH (source:IP {name: $source_ip}), (destination:IP {name: $destination_ip})
+                MERGE (source)-[t:TRANSPORT {name: $transport}]->(destination)
+                ON CREATE SET t.source_port = $source_port, t.destination_port = $destination_port, t.count = 1, t.attribution_label = CASE WHEN source.name STARTS WITH 'w1-s' THEN source.name ELSE $attribution_label END
+                ON MATCH SET t.count = t.count + 1
             """
-            session.run(create_or_update_edge_cypher, params)
+            session.run(create_or_update_relationship_cypher, params)
 
-        starting_nodes = [f"w1-s{i}" for i in range(1, 255)]
-        set_attribution_label_recursive(session, starting_nodes)
+            previous_packet = params
 
-        merge_edges(session)
+        #filter out nodes that are not connected to any other nodes
+        total_deleted_nodes = delete_irrelevant_nodes(session)
 
     driver.close()
-    print('Nodes and relationships created in Neo4j')
+    print(f'Nodes and relationships created in Neo4j, {total_deleted_nodes} irrelevant nodes deleted.')
+    print('completed')
+
 
 
 if __name__ == "__main__":
@@ -246,12 +207,4 @@ if __name__ == "__main__":
     end_time = time.time()
     execution_time = end_time - start_time
     print(f'Execution time is: {execution_time} seconds')
-
-
-
-
-
-
-
-
 
