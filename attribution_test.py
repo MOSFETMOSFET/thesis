@@ -40,19 +40,19 @@ def set_attribution_label(session, node_name):
 
     matched = False
 
-    # 查询指向该节点的边
+    # get incoming edges
     incoming_rels = session.run("""
         MATCH (n {name: $node_name})<-[r]-()
         RETURN r.source_port AS source_port, r.destination_port AS destination_port, r.transport AS transport, r.attribution_label AS attribution_label
     """, node_name=node_name).data()
 
-    # 查询从该节点发出的边
+    # get outcoming edges
     outgoing_rels = session.run("""
         MATCH (n {name: $node_name})-[r]->()
         RETURN ID(r) AS id, r.source_port AS source_port, r.destination_port AS destination_port, r.transport AS transport
     """, node_name=node_name).data()
 
-    # 比较入边和出边的属性
+    # compare
     for incoming_rel in incoming_rels:
         for outgoing_rel in outgoing_rels:
             if (
@@ -62,7 +62,7 @@ def set_attribution_label(session, node_name):
             ):
 
                 matched = True
-                # 如果属性相同，更新出边的 attribution_label
+                # update attribution label of outcoming edge
                 session.run("""
                     MATCH ()-[r]->() WHERE ID(r) = $id
                     SET r.attribution_label = $attribution_label
