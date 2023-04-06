@@ -52,6 +52,36 @@ def delete_irrelevant_nodes(session):
     return total_deleted_nodes
 
 
+def set_attribution_label_recursive(session, starting_nodes, visited_edges=None, iteration=0):
+    if visited_edges is None:
+        visited_edges = set()
+
+    print(f"Current iteration: {iteration}")
+
+    for start_node_name in starting_nodes:
+        cypher = f"""
+            MATCH (start_node:IP {{name: '{start_node_name}'}})
+            MATCH (start_node)-[direct_conn:TRANSPORT]->(direct_neighbor:IP)
+            WHERE NOT id(direct_conn) IN {list(visited_edges)}
+            SET direct_conn.attribution_label = start_node.name
+            WITH start_node, direct_neighbor, direct_conn
+            MATCH (direct_neighbor)-[outgoing:TRANSPORT]->(other:IP)
+            WHERE (direct_neighbor)-[:TRANSPORT {{source_port: outgoing.source_port, destination_port: outgoing.destination_port, name: outgoing.name}}]->(start_node)
+                  AND NOT id(outgoing) IN {list(visited_edges)}
+            SET outgoing.attribution_label = start_node.name
+            RETURN id(direct_conn) as direct_conn_id, id(outgoing) as outgoing_id, other.name as other_name
+        """
+        records = session.run(cypher)
+
+        next_starting_nodes = []
+        for record in records:
+            next_starting_nodes.append(record["other_name"])
+            visited_edges.add(record["direct_conn_id"])
+            visited_edges.add(record["outgoing_id"])
+
+        if next_starting_nodes:
+            set_attribution_label_recursive(session, next_starting_nodes, visited_edges, iteration=iteration + 1)
+
 def get_packetbeat_filtered_packets() -> None:
     """Retrieves packetbeat packets from the Elasticsearch database and saves
     them to a newly created local database and adds relationships to Neo4j."""
@@ -133,8 +163,6 @@ def get_packetbeat_filtered_packets() -> None:
 
     with driver.session() as session:
 
-        previous_packet = None
-
         for h in s.scan():
 
             source_ip = convert_ip_to_w1_sx(h.source.ip)
@@ -152,23 +180,8 @@ def get_packetbeat_filtered_packets() -> None:
                 "transport": getattr(h.network, "transport", "unknown"),
                 "source_hostname": source_hostname or source_ip,
                 "destination_hostname": destination_hostname or destination_ip,
-                "attribution_label": None,
+                "attribution_label": "unknown",
             }
-
-            if (
-                    previous_packet
-                    and previous_packet["source_port"] == params["source_port"]
-                    and previous_packet["destination_port"] == params["destination_port"]
-                    and previous_packet["transport"] == params["transport"]
-                    and (
-                    previous_packet["attribution_label"] == "none"
-                    or source_ip.startswith("w1-s")
-                    or previous_packet["source_ip"].startswith("w1-s")
-            )
-            ):
-                params["attribution_label"] = previous_packet["attribution_label"]
-            else:
-                params["attribution_label"] = "none"
 
             # create nodes
 
@@ -181,19 +194,20 @@ def get_packetbeat_filtered_packets() -> None:
 
             session.run(create_or_update_node_cypher, params)
 
-            # create relationship
+            # create relationships
             create_or_update_relationship_cypher = """
                 MATCH (source:IP {name: $source_ip}), (destination:IP {name: $destination_ip})
-                MERGE (source)-[t:TRANSPORT {name: $transport}]->(destination)
-                ON CREATE SET t.source_port = $source_port, t.destination_port = $destination_port, t.count = 1, t.attribution_label = CASE WHEN source.name STARTS WITH 'w1-s' THEN source.name ELSE $attribution_label END
-                ON MATCH SET t.count = t.count + 1
+                CREATE (source)-[t:TRANSPORT {name: $transport, source_port: $source_port, destination_port: $destination_port, attribution_label: CASE WHEN source.name STARTS WITH 'w1-s' THEN source.name ELSE $attribution_label END, event_start: $event_start, event_end: $event_end, count: 1}]->(destination)
             """
-            session.run(create_or_update_relationship_cypher, params)
 
-            previous_packet = params
+            session.run(create_or_update_relationship_cypher, params)
 
         #filter out nodes that are not connected to any other nodes
         total_deleted_nodes = delete_irrelevant_nodes(session)
+
+        starting_nodes = [f"w1-s{i}" for i in range(1, 255)]
+        set_attribution_label_recursive(session, starting_nodes)
+
 
     driver.close()
     print(f'Nodes and relationships created in Neo4j, {total_deleted_nodes} irrelevant nodes deleted.')
