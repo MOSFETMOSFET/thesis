@@ -71,6 +71,32 @@ def set_attribution_label(session, node_name):
 
     return matched
 
+def merge_edges(session):
+    query = """
+    MATCH (a)-[r:TRANSPORT]->(b)
+    WHERE r.attribution_label = 'unknown'
+    WITH a, b, r.transport as transport, collect(r) as edges
+    WHERE size(edges) > 1
+    CREATE (a)-[merged:TRANSPORT {
+        transport: transport,
+        attribution_label: 'unknown',
+        source_ports: [x in edges | x.source_port],
+        destination_ports: [x in edges | x.destination_port]
+    }]->(b)
+    FOREACH (r IN edges | DELETE r)
+    RETURN a, b, transport, size(edges) as merged_count
+    """
+
+    result = session.run(query)
+    merged_count = 0
+
+    for record in result:
+        merged_count += record["merged_count"]
+
+    print(f"Merged {merged_count} edges")
+
+
+
 uri = "bolt://localhost:7687"
 user = "neo4j"
 password = "password"
@@ -92,7 +118,10 @@ nodes = [
 rels = [
     {'source': 'w1-s2',       'target': '192.168.0.3', 'source_port': 1234, 'destination_port': 2345, 'transport': 'tcp',  'attribution_label': 'unknown'},
     {'source': '192.168.0.3', 'target': '192.168.0.4', 'source_port': 1234, 'destination_port': 2345, 'transport': 'tcp', 'attribution_label': 'unknown'},
+    {'source': '192.168.0.3', 'target': '192.168.0.4', 'source_port': 3242, 'destination_port': 245, 'transport': 'tcp', 'attribution_label': 'unknown'},
+    {'source': '192.168.0.3', 'target': '192.168.0.4', 'source_port': 124, 'destination_port': 235, 'transport': 'tcp', 'attribution_label': 'unknown'},
     {'source': '192.168.0.4', 'target': '192.168.0.5', 'source_port': 1234, 'destination_port': 2345, 'transport': 'tcp', 'attribution_label': 'unknown'},
+    {'source': '192.168.0.5', 'target': '192.168.0.6', 'source_port': 14, 'destination_port': 34, 'transport': 'tcp', 'attribution_label': 'unknown'},
     {'source': '192.168.0.4', 'target': '192.168.0.6', 'source_port': random.randint(1, 65536), 'destination_port': random.randint(1, 65536), 'transport': random.choice(['tcp', 'udp', 'icmp']), 'attribution_label': 'unknown'},
     {'source': '192.168.0.3', 'target': '192.168.0.7', 'source_port': random.randint(1, 65536), 'destination_port': random.randint(1, 65536), 'transport': random.choice(['tcp', 'udp', 'icmp']), 'attribution_label': 'unknown'},
     {'source': '192.168.0.7', 'target': '192.168.0.8', 'source_port': random.randint(1, 65536), 'destination_port': random.randint(1, 65536), 'transport': random.choice(['tcp', 'udp', 'icmp']), 'attribution_label': 'unknown'},
@@ -121,6 +150,9 @@ with driver.session() as session:
     set_initial_attribution_labels(session, 'w1-s')
     set_attribution_label(session, vpn_instance)
     propagate_labels(session, vpn_instance)
+    merge_edges(session)
+
+
 
 driver.close()
 
